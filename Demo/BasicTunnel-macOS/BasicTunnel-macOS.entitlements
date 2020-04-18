@@ -10,9 +10,13 @@
 	<true/>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>$(TeamIdentifierPrefix)group.com.algoritmico.macos.demo.BasicTunnel</string>
+		<string>group.com.protonvpn.ios.demo.BasicTunnel</string>
 	</array>
 	<key>com.apple.security.network.client</key>
 	<true/>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)com.algoritmico.macos.demo.234324.BasicTunnel</string>
+	</array>
 </dict>
 </plist>
