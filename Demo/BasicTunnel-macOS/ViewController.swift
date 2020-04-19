@@ -98,7 +98,7 @@ aeb893d9a96d1f15519bb3c4dcb40ee3
                                                   direction: .client)!
 
 extension ViewController {
-    private static let appGroup = "group.com.protonvpn.ios.demo.BasicTunnel"
+    private static let appGroup = "J6S6Q257EK.group.com.protonvpn.ios.demo.BasicTunnel"
     
     private static let tunnelIdentifier = "com.algoritmico.macos.demo.234324.BasicTunnel.Extension"
     
