@@ -1,9 +1,9 @@
 //
 //  ViewController.swift
-//  BasicTunnel-iOS
+//  Demo
 //
 //  Created by Davide De Rosa on 2/11/17.
-//  Copyright (c) 2018 Davide De Rosa. All rights reserved.
+//  Copyright (c) 2020 Davide De Rosa. All rights reserved.
 //
 //  https://github.com/keeshux
 //
@@ -22,21 +22,8 @@
 //  You should have received a copy of the GNU General Public License
 //  along with TunnelKit.  If not, see <http://www.gnu.org/licenses/>.
 //
-//  This file incorporates work covered by the following copyright and
-//  permission notice:
-//
-//      Copyright (c) 2018-Present Private Internet Access
-//
-//      Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
-//
-//      The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
-//
-//      THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-//
-//
 
 import UIKit
-import NetworkExtension
 import TunnelKit
 
 private let ca = OpenVPN.CryptoContainer(pem: """
@@ -153,11 +140,7 @@ class ViewController: UIViewController, URLSessionDataDelegate {
 
     @IBOutlet var textLog: UITextView!
 
-    //
-    
-    var currentManager: NETunnelProviderManager?
-    
-    var status = NEVPNStatus.invalid
+    private let vpn = StandardVPNProvider(bundleIdentifier: tunnelIdentifier)
     
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -169,144 +152,66 @@ class ViewController: UIViewController, URLSessionDataDelegate {
         textUsername.text = "KA1gs9DAARU9px2R0LS9tgDD"
         textPassword.text = "0S2dAE9c74GaGt95ki6DuCoq"
         
-        NotificationCenter.default.addObserver(self,
-                                               selector: #selector(VPNStatusDidChange(notification:)),
-                                               name: .NEVPNStatusDidChange,
-                                               object: nil)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(VPNStatusDidChange(notification:)),
+            name: VPN.didChangeStatus,
+            object: nil
+        )
         
-        reloadCurrentManager(nil)
+        vpn.prepare(completionHandler: nil)
 
-        //
-        
         testFetchRef()
     }
     
     @IBAction func connectionClicked(_ sender: Any) {
-        let block = {
-            switch (self.status) {
-            case .invalid, .disconnected:
-                self.connect()
-                
-            case .connected, .connecting:
-                self.disconnect()
-                
-            default:
-                break
-            }
-        }
-        
-        if (status == .invalid) {
-            reloadCurrentManager({ (error) in
-                block()
-            })
-        }
-        else {
-            block()
+        switch vpn.status {
+        case .disconnected:
+            connect()
+            
+        case .connected, .connecting, .disconnecting:
+            disconnect()
         }
     }
     
     @IBAction func tcpClicked(_ sender: Any) {
-        if switchTCP.isOn {
-            textPort.text = "502"
-        } else {
-            textPort.text = "1198"
-        }
     }
     
     func connect() {
-        configureVPN({ (manager) in
-            return self.makeProtocol()
-        }, completionHandler: { (error) in
+        let server = textServer.text!
+        let domain = textDomain.text!
+        let hostname = ((domain == "") ? server : [server, domain].joined(separator: "."))
+        let port = UInt16(textPort.text!)!
+        let socketType: SocketType = switchTCP.isOn ? .tcp : .udp
+
+        let credentials = OpenVPN.Credentials(textUsername.text!, textPassword.text!)
+        let cfg = Configuration.make(hostname: hostname, port: port, socketType: socketType)
+        let proto = try! cfg.generatedTunnelProtocol(
+            withBundleIdentifier: tunnelIdentifier,
+            appGroup: appGroup,
+            credentials: credentials
+        )
+        let neCfg = NetworkExtensionVPNConfiguration(protocolConfiguration: proto, onDemandRules: [])
+        vpn.reconnect(configuration: neCfg) { (error) in
             if let error = error {
                 print("configure error: \(error)")
                 return
             }
-            let session = self.currentManager?.connection as! NETunnelProviderSession
-            do {
-                try session.startTunnel()
-            } catch let e {
-                print("error starting tunnel: \(e)")
-            }
-        })
+        }
     }
     
     func disconnect() {
-        configureVPN({ (manager) in
-            return nil
-        }, completionHandler: { (error) in
-            self.currentManager?.connection.stopVPNTunnel()
-        })
+        vpn.disconnect(completionHandler: nil)
     }
 
     @IBAction func displayLog() {
-        guard let vpn = currentManager?.connection as? NETunnelProviderSession else {
-            return
-        }
-        try? vpn.sendProviderMessage(OpenVPNTunnelProvider.Message.requestLog.data) { (data) in
-            guard let data = data, let log = String(data: data, encoding: .utf8) else {
-                return
-            }
+        vpn.requestDebugLog(fallback: { "" }) { (log) in
             self.textLog.text = log
-        }
-    }
-
-    func configureVPN(_ configure: @escaping (NETunnelProviderManager) -> NETunnelProviderProtocol?, completionHandler: @escaping (Error?) -> Void) {
-        reloadCurrentManager { (error) in
-            if let error = error {
-                print("error reloading preferences: \(error)")
-                completionHandler(error)
-                return
-            }
-            
-            let manager = self.currentManager!
-            if let protocolConfiguration = configure(manager) {
-                manager.protocolConfiguration = protocolConfiguration
-            }
-            manager.isEnabled = true
-            
-            manager.saveToPreferences { (error) in
-                if let error = error {
-                    print("error saving preferences: \(error)")
-                    completionHandler(error)
-                    return
-                }
-                print("saved preferences")
-                self.reloadCurrentManager(completionHandler)
-            }
-        }
-    }
-    
-    func reloadCurrentManager(_ completionHandler: ((Error?) -> Void)?) {
-        NETunnelProviderManager.loadAllFromPreferences { (managers, error) in
-            if let error = error {
-                completionHandler?(error)
-                return
-            }
-            
-            var manager: NETunnelProviderManager?
-            
-            for m in managers! {
-                if let p = m.protocolConfiguration as? NETunnelProviderProtocol {
-                    if (p.providerBundleIdentifier == ViewController.tunnelIdentifier) {
-                        manager = m
-                        break
-                    }
-                }
-            }
-            
-            if (manager == nil) {
-                manager = NETunnelProviderManager()
-            }
-            
-            self.currentManager = manager
-            self.status = manager!.connection.status
-            self.updateButton()
-            completionHandler?(nil)
         }
     }
     
     func updateButton() {
-        switch status {
+        switch vpn.status {
         case .connected, .connecting:
             buttonConnection.setTitle("Disconnect", for: .normal)
             
@@ -315,19 +220,11 @@ class ViewController: UIViewController, URLSessionDataDelegate {
             
         case .disconnecting:
             buttonConnection.setTitle("Disconnecting", for: .normal)
-            
-        default:
-            break
         }
     }
     
     @objc private func VPNStatusDidChange(notification: NSNotification) {
-        guard let status = currentManager?.connection.status else {
-            print("VPNStatusDidChange")
-            return
-        }
-        print("VPNStatusDidChange: \(status.rawValue)")
-        self.status = status
+        print("VPNStatusDidChange: \(vpn.status)")
         updateButton()
     }
     

@@ -128,8 +128,11 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
     
     private var isCountingData = false
     
+    private var shouldReconnect = false
+
     // MARK: NEPacketTunnelProvider (XPC queue)
     
+    /// :nodoc:
     open override var reasserting: Bool {
         didSet {
             log.debug("Reasserting flag \(reasserting ? "set" : "cleared")")
@@ -177,18 +180,7 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        // optional credentials
-        let credentials: OpenVPN.Credentials?
-        if let username = protocolConfiguration.username, let passwordReference = protocolConfiguration.passwordReference,
-            let password = try? Keychain.password(for: username, reference: passwordReference) {
-
-            credentials = OpenVPN.Credentials(username, password)
-        } else {
-            credentials = nil
-        }
-
-        strategy = ConnectionStrategy(configuration: cfg)
-
+        // prepare for logging (append)
         if let content = cfg.existingLog(in: appGroup) {
             var existingLog = content.components(separatedBy: "\n")
             if let i = existingLog.firstIndex(of: logSeparator) {
@@ -200,15 +192,26 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
             existingLog.append("")
             memoryLog.start(with: existingLog)
         }
-
         configureLogging(
             debug: cfg.shouldDebug,
             customFormat: cfg.debugLogFormat
         )
         
+        // logging only ACTIVE from now on
+        
         // override library configuration
         if let masksPrivateData = cfg.masksPrivateData {
             CoreConfiguration.masksPrivateData = masksPrivateData
+        }
+
+        // optional credentials
+        let credentials: OpenVPN.Credentials?
+        if let username = protocolConfiguration.username, let passwordReference = protocolConfiguration.passwordReference,
+            let password = try? Keychain.password(for: username, reference: passwordReference) {
+
+            credentials = OpenVPN.Credentials(username, password)
+        } else {
+            credentials = nil
         }
 
         log.info("Starting tunnel...")
@@ -220,7 +223,10 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
         }
 
         cfg.print(appVersion: appVersion)
-        
+
+        // prepare to pick endpoints
+        strategy = ConnectionStrategy(configuration: cfg)
+
         let session: OpenVPNSession
         do {
             session = try OpenVPNSession(queue: tunnelQueue, configuration: cfg.sessionConfiguration, cachesURL: cachesURL)
@@ -287,7 +293,7 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
             }
             
         case .serverConfiguration:
-            if let cfg = session?.serverConfiguration() {
+            if let cfg = session?.serverConfiguration() as? OpenVPN.Configuration {
                 let encoder = JSONEncoder()
                 response = try? encoder.encode(cfg)
             }
@@ -300,10 +306,12 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
 
     // MARK: Wake/Sleep (debugging placeholders)
 
+    /// :nodoc:
     open override func wake() {
         log.verbose("Wake signal received")
     }
     
+    /// :nodoc:
     open override func sleep(completionHandler: @escaping () -> Void) {
         log.verbose("Sleep signal received")
         completionHandler()
@@ -311,7 +319,7 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
     
     // MARK: Connection (tunnel queue)
     
-    private func connectTunnel(upgradedSocket: GenericSocket? = nil, preferredAddress: String? = nil) {
+    private func connectTunnel(upgradedSocket: GenericSocket? = nil) {
         log.info("Creating link session")
         
         // reuse upgraded socket
@@ -321,7 +329,7 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
             return
         }
         
-        strategy.createSocket(from: self, timeout: dnsTimeout, preferredAddress: preferredAddress, queue: tunnelQueue) { (socket, error) in
+        strategy.createSocket(from: self, timeout: dnsTimeout, queue: tunnelQueue) { (socket, error) in
             guard let socket = socket else {
                 self.disposeTunnel(error: error)
                 return
@@ -341,7 +349,7 @@ open class OpenVPNTunnelProvider: NEPacketTunnelProvider {
     }
     
     private func finishTunnelDisconnection(error: Error?) {
-        if let session = session, !(reasserting && session.canRebindLink()) {
+        if let session = session, !(shouldReconnect && session.canRebindLink()) {
             session.cleanup()
         }
         
@@ -419,12 +427,12 @@ extension OpenVPNTunnelProvider: GenericSocketDelegate {
     /// :nodoc:
     public func socketDidTimeout(_ socket: GenericSocket) {
         log.debug("Socket timed out waiting for activity, cancelling...")
-        reasserting = true
+        shouldReconnect = true
         socket.shutdown()
 
         // fallback: TCP connection timeout suggests falling back
         if let _ = socket as? NETCPSocket {
-            guard tryNextProtocol() else {
+            guard tryNextEndpoint() else {
                 // disposeTunnel
                 return
             }
@@ -471,25 +479,26 @@ extension OpenVPNTunnelProvider: GenericSocketDelegate {
 
         // fallback: UDP is connection-less, treat negotiation timeout as socket timeout
         if didTimeoutNegotiation {
-            guard tryNextProtocol() else {
+            guard tryNextEndpoint() else {
                 // disposeTunnel
                 return
             }
         }
 
         // reconnect?
-        if reasserting {
+        if shouldReconnect {
             log.debug("Disconnection is recoverable, tunnel will reconnect in \(reconnectionDelay) milliseconds...")
             tunnelQueue.schedule(after: .milliseconds(reconnectionDelay)) {
-                log.debug("Tunnel is about to reconnect...")
 
-                // give up if reasserting cleared in the meantime
-                guard self.reasserting else {
-                    log.warning("Reasserting flag was cleared in the meantime")
+                // give up if shouldReconnect cleared in the meantime
+                guard self.shouldReconnect else {
+                    log.warning("Reconnection flag was cleared in the meantime")
                     return
                 }
 
-                self.connectTunnel(upgradedSocket: upgradedSocket, preferredAddress: socket.remoteAddress)
+                log.debug("Tunnel is about to reconnect...")
+                self.reasserting = true
+                self.connectTunnel(upgradedSocket: upgradedSocket)
             }
             return
         }
@@ -565,7 +574,7 @@ extension OpenVPNTunnelProvider: OpenVPNSessionDelegate {
             
             log.info("Tunnel interface is now UP")
             
-            session.setTunnel(tunnel: NETunnelInterface(impl: self.packetFlow, isIPv6: options.ipv6 != nil))
+            session.setTunnel(tunnel: NETunnelInterface(impl: self.packetFlow))
 
             self.pendingStartHandler?(nil)
             self.pendingStartHandler = nil
@@ -576,13 +585,17 @@ extension OpenVPNTunnelProvider: OpenVPNSessionDelegate {
     }
     
     /// :nodoc:
-    public func sessionDidStop(_: OpenVPNSession, shouldReconnect: Bool) {
-        log.info("Session did stop")
+    public func sessionDidStop(_: OpenVPNSession, withError error: Error?, shouldReconnect: Bool) {
+        if let error = error {
+            log.error("Session did stop with error: \(error)")
+        } else {
+            log.info("Session did stop")
+        }
 
         isCountingData = false
         refreshDataCount()
 
-        reasserting = shouldReconnect
+        self.shouldReconnect = shouldReconnect
         socket?.shutdown()
     }
     
@@ -734,7 +747,7 @@ extension OpenVPNTunnelProvider: OpenVPNSessionDelegate {
                 let gateway = table.defaultGateway4()?.gateway(),
                 let route = table.broadestRoute4(matchingDestination: gateway) {
 
-                route.partitioned().forEach {
+                route.partitioned()?.forEach {
                     let destination = $0.network()
                     guard let netmask = $0.networkMask() else {
                         return
@@ -751,7 +764,7 @@ extension OpenVPNTunnelProvider: OpenVPNSessionDelegate {
                 let gateway = table.defaultGateway6()?.gateway(),
                 let route = table.broadestRoute6(matchingDestination: gateway) {
 
-                route.partitioned().forEach {
+                route.partitioned()?.forEach {
                     let destination = $0.network()
                     let prefix = $0.prefix()
                     
@@ -769,14 +782,15 @@ extension OpenVPNTunnelProvider: OpenVPNSessionDelegate {
         newSettings.ipv6Settings = ipv6Settings
         newSettings.dnsSettings = dnsSettings
         newSettings.proxySettings = proxySettings
-        
+        newSettings.mtu = NSNumber(value: cfg.mtu)
+
         setTunnelNetworkSettings(newSettings, completionHandler: completionHandler)
     }
 }
 
 extension OpenVPNTunnelProvider {
-    private func tryNextProtocol() -> Bool {
-        guard strategy.tryNextProtocol() else {
+    private func tryNextEndpoint() -> Bool {
+        guard strategy.tryNextEndpoint() else {
             disposeTunnel(error: ProviderError.exhaustedProtocols)
             return false
         }
@@ -876,6 +890,9 @@ extension OpenVPNTunnelProvider {
                 
             case .noRouting:
                 return .routing
+                
+            case .serverShutdown:
+                return .serverShutdown
 
             default:
                 return .unexpectedReply
